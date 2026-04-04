@@ -2,7 +2,7 @@
 #define CONFIG_H
 
 // --- Pulse Money Acceptors ---
-#define PIN_BANK_PULSE 4     
+#define PIN_BANK_PULSE 5     
 #define PIN_COIN_PULSE 12    
 
 // --- I2C & GPIO Expander (PCF8575) ---

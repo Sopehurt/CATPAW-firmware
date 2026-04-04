@@ -43,7 +43,9 @@ public:
     void disable();
 
     float checkAmount();
-    int   getPulseCount() const { return _pulseCount; }
+    int   getPulseCount()    const { return _pulseCount; }
+    // คืนยอดเงินที่นับได้แล้วแต่ยัง timeout ไม่ครบ (ใช้แสดง display real-time)
+    float getPendingAmount() const { return (float)_pulseCount * _pulseValue; }
 };
 
 #endif

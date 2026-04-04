@@ -1,28 +1,37 @@
 /**
  * ============================================================
- *  CATPAW FIRMWARE v1.0  |  ESP32-S3 Dev Module
+ *  MACHINE FIRMWARE v3.0  |  ESP32-S3 Dev Module
  *  Platform: PlatformIO + Arduino Framework
  *
  *  State Machine:
  *    0 - BOOT          : ตรวจสอบ Hardware
- *    1 - IDLE          : รอรับเงิน
- *    2 - PAYMENT_CHECK : รอกดปุ่ม Start
+ *    1 - IDLE          : รอรับเงิน (cash / QR)
+ *    2 - PAYMENT_CHECK : รอกดปุ่ม Start (เงินครบแล้ว)
  *    3 - READY         : นับถอยหลัง
- *    4 - OPERATION     : รัน Sequential Process 0→7
- *    5 - SUMMARY       : สรุปผล
+ *    4 - OPERATION     : รัน 6 Step อัตโนมัติ
+ *    5 - SUMMARY       : สรุปผล / รอกด START เพื่อ reset
  *    7 - LOCKED        : Hardware Error
  *
- *  Hardware:
- *    0x18 LOAD  (OUTPUT) LD0-LD7  — ใช้ lookup table LD_PIN[]
- *    0x1C LED   (OUTPUT) LED0-LED7 — ใช้ lookup table LED_PIN[]
- *    0x1E BTN   (INPUT)  BTN0 = Start (ปุ่มเดียว)
- *    0x1F WL    (INPUT)  Water Level / Switch (อ่านเฉยๆ)
+ *  ราคา: pref_price (default 20 บาท)
+ *    - Fix ไว้ 1 ค่า (แทน minStartMoney)
+ *    - ปรับได้ผ่าน MQTT: {"cmd":"set-price","value":20}
+ *    - รับเงินเหมือนเดิมทั้ง coin, bank, QR
+ *    - *** ไม่มี topup ระหว่าง OPERATION ***
  *
- *  OPERATION Logic:
- *    กด Start → รัน Process 0 (LED0+LD0 ON ตาม proc_durationSec[0])
- *             → Process 1 (LED1+LD1 ON ตาม proc_durationSec[1])
- *             → ... → Process 7 → SUMMARY
- *    เงินหักต่อวินาทีตลอดช่วง OPERATION
+ *  Operation Mode (Fixed-Step):
+ *    - 6 Step อัตโนมัติ: Step N → เปิด LD(N-1) ตัวเดียว
+ *    - แต่ละ step มี duration_ms ของตัวเอง ปรับผ่าน MQTT ได้
+ *    - Display แสดง step ปัจจุบัน (1-6)
+ *    - ไม่มีการเลือก channel โดยผู้ใช้
+ *
+ *  Connectivity:
+ *    - WiFi + MQTT  : ปรับ parameter ผ่าน server
+ *    - BLE Server   : ส่ง QR Code ไปแสดงบน CYD display
+ *
+ *  Channel Architecture:
+ *    EXP3 (0x1E) P0-P7 = ปุ่ม (Active-LOW) — Start trigger
+ *    EXP1 (0x18) P0-P7 = Relay LD0-LD7
+ *    Step 1→LD0, Step 2→LD1, Step 3→LD2, Step 4→LD3, Step 5→LD4, Step 6→LD5
  * ============================================================
  */
 
@@ -43,53 +52,58 @@
 #include "LightSensor.h"
 
 // ============================================================
-//  [SECTION A] USER PREFERENCES
-//  บันทึกใน NVS ไม่หายหลัง Reset
-//  เปลี่ยน runtime: Serial SET / MQTT set-params
+//  [SECTION A] USER PREFERENCES — แก้ไขค่าเริ่มต้นได้ที่นี่
+//  บันทึกใน NVS (Flash) ไม่หายหลัง Reset
+//  เปลี่ยน runtime ได้ผ่าน Serial: SET <key> <val>
+//                    หรือ MQTT:   {"cmd":"set-price","value":20}
 // ============================================================
 
-// ── เงิน ──
-#define DEFAULT_MIN_START_MONEY   30      // [บาท] เงินขั้นต่ำ
+// ── ราคา Fix ──
+#define DEFAULT_PRICE             20      // [บาท] ราคาต่อ session (แทน minStartMoney)
 
-// ── Deduct ──
-#define DEFAULT_DEDUCT_RATE       1       // [บาท/วิ] หักต่อวินาที
-#define DEFAULT_READY_COUNTDOWN   5       // [วิ] นับถอยหลัง
-#define DEFAULT_BOOT_DELAY_MS     3000    // [ms]
+// ── Timing ──
+#define DEFAULT_READY_COUNTDOWN   5       // [วิ] นับถอยหลังก่อนเข้า OPERATION
+#define DEFAULT_BOOT_DELAY_MS     3000    // [ms] pause หลัง Boot OK
 
-// ── Process Duration (วินาที) ──
-// แต่ละ Process รัน LED[n]+LD[n] นานกี่วิ ก่อนเปลี่ยนไป Process ถัดไป
-// ตั้งเป็น 0 = ข้าม Process นั้น
-#define DEFAULT_PROC_0_SEC   10   // Process 0
-#define DEFAULT_PROC_1_SEC   15   // Process 1
-#define DEFAULT_PROC_2_SEC   20   // Process 2
-#define DEFAULT_PROC_3_SEC   10   // Process 3
-#define DEFAULT_PROC_4_SEC   15   // Process 4
-#define DEFAULT_PROC_5_SEC   20   // Process 5
-#define DEFAULT_PROC_6_SEC   10   // Process 6
-#define DEFAULT_PROC_7_SEC   5    // Process 7
+// ── Step Duration (ms) ──
+// ปรับผ่าน MQTT: {"cmd":"set-step-duration","step":0,"value":5000}
+// หรือ Serial:   SET step0 5000
+#define NUM_STEPS           6
+#define DEFAULT_STEP_0_MS   5000    // Step 1 → LD0
+#define DEFAULT_STEP_1_MS   8000    // Step 2 → LD1
+#define DEFAULT_STEP_2_MS   6000    // Step 3 → LD2
+#define DEFAULT_STEP_3_MS   7000    // Step 4 → LD3
+#define DEFAULT_STEP_4_MS   10000   // Step 5 → LD4
+#define DEFAULT_STEP_5_MS   5000    // Step 6 → LD5
 
 // ── Pulse Money Acceptors ──
-#define DEFAULT_BANK_PULSE_VALUE  10.0f
-#define DEFAULT_COIN_PULSE_VALUE  1.0f
-#define BANK_MIN_PULSE_MS    20
-#define BANK_MAX_PULSE_MS   200
+#define DEFAULT_BANK_PULSE_VALUE   10.0f  // [บาท/pulse] แบงค์
+#define DEFAULT_COIN_PULSE_VALUE   1.0f   // [บาท/pulse] เหรียญ
+
+// ── Pulse Width Timing ──
+#define BANK_MIN_PULSE_MS     20
+#define BANK_MAX_PULSE_MS    200
 #define BANK_PULSE_TIMEOUT_MS 600
-#define COIN_MIN_PULSE_MS    15
-#define COIN_MAX_PULSE_MS   150
+#define COIN_MIN_PULSE_MS     15
+#define COIN_MAX_PULSE_MS    150
 #define COIN_PULSE_TIMEOUT_MS 400
 
 // ── Telemetry ──
-#define DEFAULT_TELEMETRY_SEC  30
+#define DEFAULT_TELEMETRY_SEC     30      // [วิ] ส่ง telemetry ทุกกี่วิ
 
 // ============================================================
 //  [SECTION B] PIN CONFIGURATION
 // ============================================================
-#define PIN_BANK_PULSE   4
+#define PIN_BANK_PULSE   5
 #define PIN_COIN_PULSE   12
+#define PI_UART_TX      13
+#define PI_UART_RX      14
 #define I2C_SDA          8
 #define I2C_SCL          9
 #define DISP_CLK         15
 #define DISP_DIO         16
+
+// ── Light Sensor ────────────────────────────────────────────
 #define PIN_LIGHT_SENSOR     1
 #define LIGHT_THRESHOLD_ADC  2000
 #define LIGHT_DEBOUNCE_MS    200
@@ -97,50 +111,99 @@
 // ============================================================
 //  [SECTION C] EXPANDER MAPPING
 //
-//  0x18 LOAD  (OUTPUT) — LD0-LD7   — lookup LD_PIN[]
-//  0x1C LED   (OUTPUT) — LED0-LED7 — lookup LED_PIN[]
-//  0x1E BTN   (INPUT)  — BTN0 = Start button เท่านั้น
-//  0x1F WL    (INPUT)  — Water Level + Switch (monitor เฉยๆ)
+//  0x18  LOAD  (OUTPUT) — Relay LD0-LD7
+//  0x1C  LED   (OUTPUT) — LED0-LED7
+//  0x1E  BTN   (INPUT)  — ปุ่ม BTN0-BTN7 (Active-LOW) → Start trigger
+//  0x1F  WL    (INPUT)  — Water Level + Switch (Active-LOW)
 //
-//  Physical wiring (logical→physical IO):
-//    LD:   LD0=IO0 LD1=IO1 LD2=IO3 LD3=IO2 LD4=IO5 LD5=IO4 LD6=IO7 LD7=IO6
-//    LED:  LED0=IO7 LED1=IO6 LED2=IO5 LED3=IO4 LED4=IO3 LED5=IO2 LED6=IO1 LED7=IO0
-//    BTN:  BTN0=IO7 (Start) — ใช้แค่ BTN0
-//    WL:   WL0=IO5 WL1=IO4 WL2=IO3 WL3=IO2 WL4=IO0 WL5=IO1 SW0=IO6 SW1=IO7
+//  LOAD (0x18):  LD0=IO0  LD1=IO1  LD2=IO3  LD3=IO2
+//                LD4=IO5  LD5=IO4  LD6=IO7  LD7=IO6
+//  LED  (0x1C):  LED0=IO7 LED1=IO6 LED2=IO5 LED3=IO4
+//                LED4=IO3 LED5=IO2 LED6=IO1 LED7=IO0
+//  BTN  (0x1E):  BTN0=IO7 BTN1=IO6 BTN2=IO5 BTN3=IO4
+//                BTN4=IO3 BTN5=IO2 BTN6=IO1 BTN7=IO0
+//  WL   (0x1F):  WL0=IO5  WL1=IO4  WL2=IO3  WL3=IO2
+//                WL4=IO0  WL5=IO1  IO6=SW0  IO7=SW1
 // ============================================================
-#define NUM_PROCESSES   8
+#define NUM_CHANNELS    8
 #define NUM_WL_LEVELS   6
 #define NUM_SWITCHES    2
 
-static const uint8_t LD_PIN[8]  = {0, 1, 3, 2, 5, 4, 7, 6};
-static const uint8_t LED_PIN[8] = {7, 6, 5, 4, 3, 2, 1, 0};
-static const uint8_t WL_PIN[6]  = {5, 4, 3, 2, 0, 1};
+static const uint8_t LD_PIN[8]  = {1, 0, 2, 3, 4, 5, 7, 6};
+static const uint8_t LED_PIN[8] = {7, 6, 5, 4, 3, 2, 0, 1};
+static const uint8_t BTN_LOGICAL[8] = {6, 7, 0, 1, 2, 3, 4, 5};
+static const uint8_t WL_PIN[6] = {5, 4, 3, 2, 0, 1};
+
 #define SW0_PIN  6
 #define SW1_PIN  7
-
-// BTN0 = IO7 บน EXP3 (0x1E) — Active LOW
-#define BTN0_PHYSICAL_IO  7
+#define EXP5_ADDR  0x27
 
 // ============================================================
 //  [SECTION D] NETWORK CONFIG
 // ============================================================
-#define WIFI_SSID        "SR803_5G"
-#define WIFI_PASS        "80323SM5F"
-#define MQTT_SERVER      "147.50.255.120"
-#define MQTT_PORT        9359
-#define MQTT_USER        "esp32"
-#define MQTT_PASS        "Taweesak@5050"
-#define MQTT_PREFIX      "machine/catpaw"
-#define BLE_SERVER_NAME  "ESP32S3-QR"
-#define BLE_SERVICE_UUID "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
-#define BLE_CHAR_UUID    "beb5483e-36e1-4688-b7f5-ea07361b26a8"
+#define WIFI_SSID           "SR803_5G"
+#define WIFI_PASS           "80323SM5F"
+
+#define MQTT_SERVER         "147.50.255.120"
+#define MQTT_PORT           9359
+#define MQTT_USER           "esp32"
+#define MQTT_PASS           "Taweesak@5050"
+#define MQTT_PREFIX         "machine/vend"
+
+#define BLE_SERVER_NAME     "ESP32S3-QR"
+#define BLE_SERVICE_UUID    "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
+#define BLE_CHAR_UUID       "beb5483e-36e1-4688-b7f5-ea07361b26a8"
 
 // ============================================================
 //  [SECTION E] CONSTANTS
 // ============================================================
 #define MAX_LOG_ENTRIES   64
-#define BTN_POLL_MS       50
-#define BTN_DEBOUNCE_MS   120
+#define BTN_POLL_MS       20
+#define BTN_DEBOUNCE_MS   60
+
+// ============================================================
+//  MQTT COMMAND QUEUE
+// ============================================================
+#define MQTT_DEFER_IDLE_MS   (5UL * 60UL * 1000UL)
+#define MQTT_QUEUE_SLOTS     4
+#define MQTT_JSON_MAX        512
+
+struct MqttDeferredCmd { bool used; char json[MQTT_JSON_MAX]; };
+MqttDeferredCmd mqttQueue[MQTT_QUEUE_SLOTS] = {};
+bool            _applyingQueue = false;
+
+void mqttEnqueue(const String& json) {
+    for (int i = 0; i < MQTT_QUEUE_SLOTS; i++) {
+        if (!mqttQueue[i].used) {
+            strncpy(mqttQueue[i].json, json.c_str(), MQTT_JSON_MAX - 1);
+            mqttQueue[i].used = true;
+            Serial.println(F("[MQTT] Queued (session active)"));
+            return;
+        }
+    }
+    memmove(&mqttQueue[0], &mqttQueue[1],
+            sizeof(MqttDeferredCmd) * (MQTT_QUEUE_SLOTS - 1));
+    strncpy(mqttQueue[MQTT_QUEUE_SLOTS-1].json, json.c_str(), MQTT_JSON_MAX - 1);
+    mqttQueue[MQTT_QUEUE_SLOTS-1].used = true;
+    Serial.println(F("[MQTT] Queue full — oldest dropped"));
+}
+
+void mqttCallback(char* topic, byte* payload, unsigned int len);  // forward
+
+void mqttProcessQueue() {
+    bool hasCmd = false;
+    for (int i = 0; i < MQTT_QUEUE_SLOTS; i++) if (mqttQueue[i].used) { hasCmd = true; break; }
+    if (!hasCmd) return;
+    Serial.println(F("[MQTT] Applying deferred commands..."));
+    _applyingQueue = true;
+    for (int i = 0; i < MQTT_QUEUE_SLOTS; i++) {
+        if (!mqttQueue[i].used) continue;
+        Serial.println("[MQTT] Deferred: " + String(mqttQueue[i].json));
+        mqttCallback(nullptr, (byte*)mqttQueue[i].json, strlen(mqttQueue[i].json));
+        mqttQueue[i].used = false;
+    }
+    _applyingQueue = false;
+}
 
 // ============================================================
 //  STATE MACHINE
@@ -159,7 +222,7 @@ const char* stateNames[] = {
 };
 
 // ============================================================
-//  LOG STRUCTURE
+//  LOG
 // ============================================================
 struct LogEntry {
     char     event[24];
@@ -172,10 +235,11 @@ struct LogEntry {
 //  GLOBAL OBJECTS
 // ============================================================
 TM1637Display   display(DISP_CLK, DISP_DIO);
-ExpanderManager expander1(0x18);   // LOAD
-ExpanderManager expander2(0x1C);   // LED
-ExpanderManager expander3(0x1E);   // BTN
-ExpanderManager expander4(0x1F);   // WL+SW
+ExpanderManager expander1(0x18);
+ExpanderManager expander2(0x1C);
+ExpanderManager expander3(0x1E);
+ExpanderManager expander4(0x1F);
+ExpanderManager expander5(EXP5_ADDR);
 MoneyReader     bankReader(PIN_BANK_PULSE, DEFAULT_BANK_PULSE_VALUE,
                            BANK_MIN_PULSE_MS, BANK_MAX_PULSE_MS, BANK_PULSE_TIMEOUT_MS);
 MoneyReader     coinReader(PIN_COIN_PULSE, DEFAULT_COIN_PULSE_VALUE,
@@ -184,6 +248,7 @@ LightSensor     lightSensor(PIN_LIGHT_SENSOR, LIGHT_THRESHOLD_ADC, LIGHT_DEBOUNC
 Preferences     prefs;
 WiFiClient      espClient;
 PubSubClient    mqttClient(espClient);
+
 BLEServer*         bleServer          = nullptr;
 BLECharacteristic* bleChar            = nullptr;
 bool               bleClientConnected = false;
@@ -194,50 +259,40 @@ bool               bleClientConnected = false;
 SystemState   currentState    = STATE_BOOT;
 bool          stateChanged    = true;
 unsigned long stateEnterTime  = 0;
+
 float         totalMoney      = 0.0f;
 
-// ── Operation state ──
-int           currentProcess     = 0;       // Process ที่กำลังรันอยู่ (0-7)
-unsigned long processStartTime   = 0;       // เวลาเริ่ม Process ปัจจุบัน
-unsigned long lastDeductTime     = 0;       // หักเงินล่าสุด
-bool          operationRunning   = false;   // กำลัง run process อยู่
-
-// ── Process log ──
-uint32_t      procActualMs[NUM_PROCESSES] = {};  // เวลาจริงที่รันแต่ละ Process
-
-// ── Countdown ──
-int           countdownRemaining  = 0;
-unsigned long lastCountdownTick   = 0;
-
-// ── Money check ──
-unsigned long lastMoneyCheck    = 0;
-unsigned long lastDisplayRefresh = 0;
-
-// ── Water Level ──
+// ── Water Level & Switch ──
 bool     wlState[NUM_WL_LEVELS] = {};
 bool     swState[NUM_SWITCHES]  = {};
 int      waterLevel             = 0;
 int      prevWaterLevel         = -1;
 
-// ── Log ──
-LogEntry sessionLog[MAX_LOG_ENTRIES];
-int      logCount = 0;
+unsigned long lastMoneyCheck     = 0;
+int           countdownRemaining = 0;
+unsigned long lastCountdownTick  = 0;
 
-// ── NVS ──
-int pref_minStartMoney;
-int pref_deductRate;
+// ── Operation: Step tracking ──
+int           currentStep    = 0;   // 0-based
+unsigned long stepStartTime  = 0;
+
+LogEntry      sessionLog[MAX_LOG_ENTRIES];
+int           logCount = 0;
+
+// ── NVS loaded values ──
+int pref_price;               // ราคา fix (แทน minStartMoney)
 int pref_readyCountdown;
 int pref_bootDelayMs;
 int pref_telemetrySec;
-int pref_procSec[NUM_PROCESSES];
+int pref_stepDurationMs[NUM_STEPS];
 
 String DEVICE_ID;
 
 // ── Serial debug ──
-bool  dbg_addMoney   = false;
-float dbg_addAmount  = 0.0f;
-bool  dbg_pressStart = false;
-bool  dbg_verbose    = false;
+bool  dbg_addMoney    = false;
+float dbg_addAmount   = 0.0f;
+bool  dbg_pressStart  = false;
+bool  dbg_verbose     = false;
 
 // ============================================================
 //  ISR
@@ -282,7 +337,10 @@ void initBLE() {
 }
 
 void sendBLE(const String& text) {
-    if (!bleClientConnected) return;
+    if (!bleClientConnected) {
+        Serial.printf("[BLE] No client — skipped: %s\n", text.c_str());
+        return;
+    }
     bleChar->setValue(text.c_str());
     bleChar->notify();
     Serial.printf("[BLE] Sent: %s\n", text.c_str());
@@ -297,7 +355,7 @@ void createDeviceID() {
     char id[13];
     snprintf(id, sizeof(id), "%02X%02X%02X%02X%02X%02X",
              mac[0],mac[1],mac[2],mac[3],mac[4],mac[5]);
-    DEVICE_ID = String("catpaw-") + id;
+    DEVICE_ID = String("vend-") + id;
     Serial.println("[NET] Device ID: " + DEVICE_ID);
 }
 
@@ -308,7 +366,7 @@ void connectWiFi() {
     if (WiFi.status() == WL_CONNECTED) return;
     Serial.println(F("[WiFi] Connecting..."));
     WiFi.mode(WIFI_STA);
-    WiFi.setSleep(true);   // required สำหรับ BLE+WiFi coexistence บน ESP32-S3
+    WiFi.setSleep(true);
     WiFi.setAutoReconnect(true);
     WiFi.begin(WIFI_SSID, WIFI_PASS);
     for (int i = 0; i < 50 && WiFi.status() != WL_CONNECTED; i++) {
@@ -338,11 +396,12 @@ void addLog(const char* event, uint32_t duration_ms = 0) {
 }
 
 void printSummary() {
-    Serial.println(F("╔══════════════════════════════════════════════════════╗"));
-    Serial.println(F("║              CATPAW SESSION SUMMARY                  ║"));
-    Serial.println(F("╠══════════════════════════════════════════════════════╣"));
-    Serial.printf( "║  Entries : %-42d║\n", logCount);
-    Serial.println(F("╠══════════════════════════════════════════════════════╣"));
+    Serial.println(F("╔══════════════════════════════════════════════════╗"));
+    Serial.println(F("║                  SESSION SUMMARY                 ║"));
+    Serial.println(F("╠══════════════════════════════════════════════════╣"));
+    Serial.printf( "║  Price   : %-38d║\n", pref_price);
+    Serial.printf( "║  Entries : %-38d║\n", logCount);
+    Serial.println(F("╠══════════════════════════════════════════════════╣"));
     for (int i = 0; i < logCount; i++) {
         Serial.printf("║ [%02d] [%8lu ms] %-18s ฿%-4d %lu ms\n",
             i+1,
@@ -351,119 +410,206 @@ void printSummary() {
             (int)sessionLog[i].money,
             (unsigned long)sessionLog[i].duration_ms);
     }
-    Serial.println(F("╠══════════════════════════════════════════════════════╣"));
-    Serial.println(F("║  Process summary:                                    ║"));
-    for (int p = 0; p < NUM_PROCESSES; p++) {
-        Serial.printf("║  PROC%d: config=%ds | actual=%lums\n",
-            p, pref_procSec[p], (unsigned long)procActualMs[p]);
-    }
-    Serial.println(F("╚══════════════════════════════════════════════════════╝"));
+    Serial.println(F("╚══════════════════════════════════════════════════╝"));
 }
 
 void clearLog() {
     logCount = 0;
     memset(sessionLog, 0, sizeof(sessionLog));
-    memset(procActualMs, 0, sizeof(procActualMs));
 }
 
 // ============================================================
 //  NVS PREFERENCES
 // ============================================================
 void loadPreferences() {
-    const int defProc[NUM_PROCESSES] = {
-        DEFAULT_PROC_0_SEC, DEFAULT_PROC_1_SEC,
-        DEFAULT_PROC_2_SEC, DEFAULT_PROC_3_SEC,
-        DEFAULT_PROC_4_SEC, DEFAULT_PROC_5_SEC,
-        DEFAULT_PROC_6_SEC, DEFAULT_PROC_7_SEC
+    const int defSteps[NUM_STEPS] = {
+        DEFAULT_STEP_0_MS, DEFAULT_STEP_1_MS,
+        DEFAULT_STEP_2_MS, DEFAULT_STEP_3_MS,
+        DEFAULT_STEP_4_MS, DEFAULT_STEP_5_MS
     };
-    prefs.begin("catpaw", false); prefs.end();  // ensure namespace exists
-    prefs.begin("catpaw", true);
-    pref_minStartMoney  = prefs.getInt("minMoney",     DEFAULT_MIN_START_MONEY);
-    pref_deductRate     = prefs.getInt("deductRate",   DEFAULT_DEDUCT_RATE);
+    prefs.begin("machine", false);
+    prefs.end();
+    prefs.begin("machine", true);
+    pref_price          = prefs.getInt("price",        DEFAULT_PRICE);
     pref_readyCountdown = prefs.getInt("countdown",    DEFAULT_READY_COUNTDOWN);
     pref_bootDelayMs    = prefs.getInt("bootDelay",    DEFAULT_BOOT_DELAY_MS);
     pref_telemetrySec   = prefs.getInt("telemetrySec", DEFAULT_TELEMETRY_SEC);
-    for (int p = 0; p < NUM_PROCESSES; p++) {
-        char key[8]; snprintf(key, sizeof(key), "proc%d", p);
-        pref_procSec[p] = prefs.getInt(key, defProc[p]);
+    for (int s = 0; s < NUM_STEPS; s++) {
+        char key[8]; snprintf(key, sizeof(key), "step%d", s);
+        pref_stepDurationMs[s] = prefs.getInt(key, defSteps[s]);
     }
     prefs.end();
 
     Serial.println(F("[PREFS] Loaded:"));
-    Serial.printf("  minStartMoney  = %d bath\n",  pref_minStartMoney);
-    Serial.printf("  deductRate     = %d bath/s\n", pref_deductRate);
-    Serial.printf("  readyCountdown = %d s\n",      pref_readyCountdown);
-    Serial.printf("  telemetrySec   = %d s\n",      pref_telemetrySec);
-    Serial.print( "  processDurations = [");
-    for (int p = 0; p < NUM_PROCESSES; p++)
-        Serial.printf("%d%s", pref_procSec[p], p<7?",":"]");
-    Serial.println(F(" sec"));
+    Serial.printf("  price          = %d bath\n",    pref_price);
+    Serial.printf("  readyCountdown = %d s\n",       pref_readyCountdown);
+    Serial.printf("  telemetrySec   = %d s\n",       pref_telemetrySec);
+    Serial.print( "  stepDurations  = [");
+    for (int s = 0; s < NUM_STEPS; s++)
+        Serial.printf("%d%s", pref_stepDurationMs[s], s < NUM_STEPS-1 ? "," : "] ms\n");
 }
 
 void savePreferences() {
-    prefs.begin("catpaw", false);
-    prefs.putInt("minMoney",     pref_minStartMoney);
-    prefs.putInt("deductRate",   pref_deductRate);
+    prefs.begin("machine", false);
+    prefs.putInt("price",        pref_price);
     prefs.putInt("countdown",    pref_readyCountdown);
     prefs.putInt("bootDelay",    pref_bootDelayMs);
     prefs.putInt("telemetrySec", pref_telemetrySec);
-    for (int p = 0; p < NUM_PROCESSES; p++) {
-        char key[8]; snprintf(key, sizeof(key), "proc%d", p);
-        prefs.putInt(key, pref_procSec[p]);
+    for (int s = 0; s < NUM_STEPS; s++) {
+        char key[8]; snprintf(key, sizeof(key), "step%d", s);
+        prefs.putInt(key, pref_stepDurationMs[s]);
     }
     prefs.end();
     Serial.println(F("[PREFS] Saved"));
 }
 
 void resetPreferences() {
-    prefs.begin("catpaw", false); prefs.clear(); prefs.end();
-    pref_minStartMoney  = DEFAULT_MIN_START_MONEY;
-    pref_deductRate     = DEFAULT_DEDUCT_RATE;
+    prefs.begin("machine", false); prefs.clear(); prefs.end();
+    pref_price          = DEFAULT_PRICE;
     pref_readyCountdown = DEFAULT_READY_COUNTDOWN;
     pref_bootDelayMs    = DEFAULT_BOOT_DELAY_MS;
     pref_telemetrySec   = DEFAULT_TELEMETRY_SEC;
-    const int def[NUM_PROCESSES] = {
-        DEFAULT_PROC_0_SEC, DEFAULT_PROC_1_SEC,
-        DEFAULT_PROC_2_SEC, DEFAULT_PROC_3_SEC,
-        DEFAULT_PROC_4_SEC, DEFAULT_PROC_5_SEC,
-        DEFAULT_PROC_6_SEC, DEFAULT_PROC_7_SEC
+    const int defSteps[NUM_STEPS] = {
+        DEFAULT_STEP_0_MS, DEFAULT_STEP_1_MS,
+        DEFAULT_STEP_2_MS, DEFAULT_STEP_3_MS,
+        DEFAULT_STEP_4_MS, DEFAULT_STEP_5_MS
     };
-    for (int p = 0; p < NUM_PROCESSES; p++) pref_procSec[p] = def[p];
+    for (int s = 0; s < NUM_STEPS; s++) pref_stepDurationMs[s] = defSteps[s];
     Serial.println(F("[PREFS] Reset to defaults"));
+}
+
+// ============================================================
+//  CONFIG SNAPSHOT & ROLLBACK
+// ============================================================
+String makeTopic(const String& sfx) {
+    return String(MQTT_PREFIX) + "/" + DEVICE_ID + "/" + sfx;
+}
+
+void snapshotPreferences() {
+    prefs.begin("machine_bk", false);
+    prefs.putInt("price",        pref_price);
+    prefs.putInt("countdown",    pref_readyCountdown);
+    prefs.putInt("telemetrySec", pref_telemetrySec);
+    for (int s = 0; s < NUM_STEPS; s++) {
+        char key[8]; snprintf(key, sizeof(key), "step%d", s);
+        prefs.putInt(key, pref_stepDurationMs[s]);
+    }
+    prefs.putULong("snapTime", (unsigned long)(millis() / 1000));
+    prefs.end();
+    Serial.println(F("[SNAP] Config snapshot saved"));
+}
+
+bool rollbackPreferences() {
+    prefs.begin("machine_bk", false);
+    prefs.end();
+    prefs.begin("machine_bk", true);
+    bool hasSnap = prefs.isKey("price");
+    if (hasSnap) {
+        pref_price          = prefs.getInt("price",        pref_price);
+        pref_readyCountdown = prefs.getInt("countdown",    pref_readyCountdown);
+        pref_telemetrySec   = prefs.getInt("telemetrySec", pref_telemetrySec);
+        for (int s = 0; s < NUM_STEPS; s++) {
+            char key[8]; snprintf(key, sizeof(key), "step%d", s);
+            pref_stepDurationMs[s] = prefs.getInt(key, pref_stepDurationMs[s]);
+        }
+        unsigned long snapTime = prefs.getULong("snapTime", 0);
+        prefs.end();
+        savePreferences();
+        Serial.printf("[SNAP] Rollback OK (snapshot age: %lu s)\n",
+            (unsigned long)(millis()/1000) - snapTime);
+    } else {
+        prefs.end();
+        Serial.println(F("[SNAP] No snapshot found — rollback cancelled"));
+    }
+    return hasSnap;
+}
+
+void mqttPublishSnapshot(const char* action) {
+    if (!mqttClient.connected()) return;
+    JsonDocument doc;
+    doc["deviceId"]  = DEVICE_ID;
+    doc["action"]    = action;
+    doc["price"]     = pref_price;
+    doc["countdown"] = pref_readyCountdown;
+    JsonArray steps = doc["stepDurations"].to<JsonArray>();
+    for (int s = 0; s < NUM_STEPS; s++) steps.add(pref_stepDurationMs[s]);
+    String out; serializeJson(doc, out);
+    mqttClient.publish(makeTopic("config").c_str(), out.c_str(), false);
+    Serial.println("[MQTT] Config published: " + out);
+}
+
+// ============================================================
+//  Pi UART COMM
+// ============================================================
+HardwareSerial PiSerial(2);
+
+void sendPi(JsonDocument& doc) {
+    String out; serializeJson(doc, out); out += "\n";
+    PiSerial.print(out);
+    Serial.println("[PI<<] " + out);
+}
+void sendPiState(const char* state) {
+    JsonDocument doc; doc["evt"] = "state"; doc["state"] = state; sendPi(doc);
+}
+void sendPiMoney() {
+    JsonDocument doc;
+    doc["evt"]     = "money";
+    doc["balance"] = (int)totalMoney;
+    doc["price"]   = pref_price;   // ส่ง price แทน min
+    sendPi(doc);
+}
+void sendPiStep(int step1based) {
+    JsonDocument doc;
+    doc["evt"]      = "step";
+    doc["step"]     = step1based;
+    doc["total"]    = NUM_STEPS;
+    doc["duration"] = pref_stepDurationMs[step1based - 1];
+    sendPi(doc);
 }
 
 // ============================================================
 //  STATE TRANSITION
 // ============================================================
 void transitionTo(SystemState next) {
-    Serial.printf("[STATE] %s -> %s\n", stateNames[currentState], stateNames[next]);
-    addLog(stateNames[next]);
+    Serial.printf("[STATE] %s -> %s\n",
+        stateNames[currentState], stateNames[next]);
+    if (next != STATE_READY && next != STATE_BOOT) {
+        addLog(stateNames[next]);
+    }
     currentState   = next;
     stateChanged   = true;
     stateEnterTime = millis();
+    sendPiState(stateNames[next]);
 }
 
 // ============================================================
-//  HARDWARE HELPERS
+//  RELAY / LED HELPERS
 // ============================================================
-void setProcess(int proc, bool on) {
-    if (proc < 0 || proc >= NUM_PROCESSES) return;
-    expander1.digitalWrite(LD_PIN[proc],  on ? HIGH : LOW);
-    expander2.digitalWrite(LED_PIN[proc], on ? HIGH : LOW);
-    Serial.printf("[PROC] PROC%d (LD%d IO%d + LED%d IO%d) %s\n",
-        proc, proc, LD_PIN[proc], proc, LED_PIN[proc], on ? "ON" : "OFF");
+void setChannelRelay(uint8_t ch, bool on) {
+    if (ch >= NUM_CHANNELS) return;
+    uint8_t physPin = LD_PIN[ch];
+    expander1.digitalWrite(physPin, on ? HIGH : LOW);
+    Serial.printf("[LOAD] LD%d (IO%d) %s\n", ch, physPin, on ? "ON" : "OFF");
 }
 
-void allOff() {
-    for (uint8_t p = 0; p < 8; p++) {
-        expander1.digitalWrite(LD_PIN[p],  LOW);
-        expander2.digitalWrite(LED_PIN[p], LOW);
-    }
-    Serial.println(F("[HW] All LOAD+LED OFF"));
+void allRelaysOff() {
+    for (uint8_t c = 0; c < NUM_CHANNELS; c++)
+        expander1.digitalWrite(LD_PIN[c], LOW);
+    Serial.println(F("[LOAD] All OFF"));
+}
+
+void setLED(uint8_t ch, bool on) {
+    if (ch >= NUM_CHANNELS) return;
+    expander2.digitalWrite(LED_PIN[ch], on ? HIGH : LOW);
+}
+
+void allLEDsOff() {
+    for (uint8_t c = 0; c < NUM_CHANNELS; c++)
+        expander2.digitalWrite(LED_PIN[c], LOW);
 }
 
 // ============================================================
-//  WATER LEVEL READER
+//  WATER LEVEL READER — EXP4 (0x1F)
 // ============================================================
 void updateWaterLevel() {
     Wire.beginTransmission(0x1F);
@@ -471,13 +617,17 @@ void updateWaterLevel() {
     Wire.endTransmission(false);
     Wire.requestFrom((uint8_t)0x1F, (uint8_t)1);
     uint8_t raw = Wire.available() ? Wire.read() : 0xFF;
+
     for (int i = 0; i < NUM_WL_LEVELS; i++)
         wlState[i] = !(raw & (1 << WL_PIN[i]));
     swState[0] = !(raw & (1 << SW0_PIN));
     swState[1] = !(raw & (1 << SW1_PIN));
+
     int level = 0;
-    for (int i = 0; i < NUM_WL_LEVELS; i++) if (wlState[i]) level = i + 1;
+    for (int i = 0; i < NUM_WL_LEVELS; i++)
+        if (wlState[i]) level = i + 1;
     waterLevel = level;
+
     if (waterLevel != prevWaterLevel) {
         prevWaterLevel = waterLevel;
         Serial.printf("[WL] Level=%d/6 | WL:", waterLevel);
@@ -487,32 +637,22 @@ void updateWaterLevel() {
 }
 
 // ============================================================
-//  MQTT
+//  MQTT CALLBACK
 // ============================================================
-String makeTopic(const String& sfx) {
-    return String(MQTT_PREFIX) + "/" + DEVICE_ID + "/" + sfx;
-}
-
+// Commands:
+//   {"cmd":"set-params","price":20,"stepDurations":[5000,...]}
+//   {"cmd":"rollback"}
+//   {"cmd":"get-config"}
+//   {"cmd":"set-price","value":20}
+//   {"cmd":"set-step-duration","step":0,"value":5000}  (step: 0-based)
+//   {"cmd":"ble-send","text":"https://..."}
+//   {"cmd":"reboot"}
 void mqttPublishStatus(const String& s) {
     if (!mqttClient.connected()) return;
     JsonDocument doc;
     doc["deviceId"] = DEVICE_ID; doc["status"] = s;
     String out; serializeJson(doc, out);
     mqttClient.publish(makeTopic("status").c_str(), out.c_str(), false);
-}
-
-void mqttPublishConfig(const char* action) {
-    if (!mqttClient.connected()) return;
-    JsonDocument doc;
-    doc["deviceId"]   = DEVICE_ID;
-    doc["action"]     = action;
-    doc["minMoney"]   = pref_minStartMoney;
-    doc["deductRate"] = pref_deductRate;
-    JsonArray procs = doc["processDurations"].to<JsonArray>();
-    for (int p = 0; p < NUM_PROCESSES; p++) procs.add(pref_procSec[p]);
-    String out; serializeJson(doc, out);
-    mqttClient.publish(makeTopic("config").c_str(), out.c_str(), false);
-    Serial.println("[MQTT] Config: " + out);
 }
 
 void mqttPublishAck(const String& key, int val) {
@@ -523,152 +663,122 @@ void mqttPublishAck(const String& key, int val) {
     mqttClient.publish(makeTopic("ack").c_str(), out.c_str(), false);
 }
 
-// ── Snapshot & Rollback ──
-void snapshotPreferences() {
-    prefs.begin("catpaw_bk", false);
-    prefs.putInt("minMoney",   pref_minStartMoney);
-    prefs.putInt("deductRate", pref_deductRate);
-    for (int p = 0; p < NUM_PROCESSES; p++) {
-        char key[8]; snprintf(key, sizeof(key), "proc%d", p);
-        prefs.putInt(key, pref_procSec[p]);
-    }
-    prefs.putULong("snapTime", (unsigned long)(millis()/1000));
-    prefs.end();
-    Serial.println(F("[SNAP] Snapshot saved"));
-}
-
-bool rollbackPreferences() {
-    prefs.begin("catpaw_bk", false); prefs.end();
-    prefs.begin("catpaw_bk", true);
-    bool has = prefs.isKey("minMoney");
-    if (has) {
-        pref_minStartMoney = prefs.getInt("minMoney",   pref_minStartMoney);
-        pref_deductRate    = prefs.getInt("deductRate", pref_deductRate);
-        for (int p = 0; p < NUM_PROCESSES; p++) {
-            char key[8]; snprintf(key, sizeof(key), "proc%d", p);
-            pref_procSec[p] = prefs.getInt(key, pref_procSec[p]);
-        }
-        prefs.end();
-        savePreferences();
-        Serial.println(F("[SNAP] Rollback OK"));
-    } else {
-        prefs.end();
-        Serial.println(F("[SNAP] No snapshot"));
-    }
-    return has;
-}
-
-// ── MQTT Callback ──
-// Commands:
-//   {"cmd":"set-params","minMoney":30,"deductRate":1,"durations":[10,15,20,10,15,20,10,5]}
-//   {"cmd":"set-min-money","value":30}
-//   {"cmd":"set-deduct-rate","value":1}
-//   {"cmd":"set-proc-duration","proc":0,"value":15}
-//   {"cmd":"rollback"}
-//   {"cmd":"get-config"}
-//   {"cmd":"ble-send","text":"https://..."}
-//   {"cmd":"reboot"}
 void mqttCallback(char* topic, byte* payload, unsigned int len) {
     String msg;
     for (unsigned int i = 0; i < len; i++) msg += (char)payload[i];
     Serial.println("[MQTT] << " + msg);
 
     JsonDocument doc;
-    if (deserializeJson(doc, msg)) { Serial.println(F("[MQTT] JSON error")); return; }
+    if (deserializeJson(doc, msg)) {
+        Serial.println(F("[MQTT] JSON parse error"));
+        return;
+    }
     String cmd = doc["cmd"].as<String>();
+
+    // Deferred: queue ถ้า session กำลังดำเนินอยู่
+    bool isDeferrable = (cmd == "set-params" || cmd == "set-price" ||
+                         cmd == "set-step-duration" || cmd == "rollback");
+    bool sessionActive = (currentState != STATE_IDLE && currentState != STATE_BOOT);
+    if (isDeferrable && sessionActive && !_applyingQueue) {
+        mqttEnqueue(msg);
+        return;
+    }
 
     if (cmd == "reboot") {
         mqttPublishStatus("rebooting");
         delay(500); ESP.restart();
     }
-    // ── Group update ──
     else if (cmd == "set-params") {
         snapshotPreferences();
-        mqttPublishConfig("snapshot-before-update");
+        mqttPublishSnapshot("snapshot-before-update");
+
         bool changed = false;
         String errors = "";
 
-        if (!doc["minMoney"].isNull()) {
-            int v = doc["minMoney"].as<int>();
-            if (v >= 1 && v <= 9999) { pref_minStartMoney = v; changed = true; }
-            else errors += "minMoney out of range; ";
+        if (!doc["price"].isNull()) {
+            int v = doc["price"].as<int>();
+            if (v >= 1 && v <= 9999) {
+                pref_price = v; changed = true;
+                Serial.printf("[SET] price = %d\n", v);
+            } else { errors += "price out of range(1-9999); "; }
         }
-        if (!doc["deductRate"].isNull()) {
-            int v = doc["deductRate"].as<int>();
-            if (v >= 1 && v <= 1000) { pref_deductRate = v; changed = true; }
-            else errors += "deductRate out of range; ";
-        }
-        if (doc["durations"].is<JsonArray>()) {
-            JsonArray arr = doc["durations"].as<JsonArray>();
+        if (doc["stepDurations"].is<JsonArray>()) {
+            JsonArray arr = doc["stepDurations"].as<JsonArray>();
             int idx = 0;
             for (JsonVariant v : arr) {
-                if (idx >= NUM_PROCESSES) break;
-                int sec = v.as<int>();
-                if (sec >= 0 && sec <= 3600) { pref_procSec[idx] = sec; changed = true; }
-                else { char e[32]; snprintf(e,sizeof(e),"proc%d out of range; ",idx); errors += e; }
+                if (idx >= NUM_STEPS) break;
+                int ms = v.as<int>();
+                if (ms >= 500 && ms <= 600000) {
+                    pref_stepDurationMs[idx] = ms; changed = true;
+                    Serial.printf("[SET] step[%d] = %d ms\n", idx, ms);
+                } else {
+                    char e[40]; snprintf(e, sizeof(e), "step[%d] out of range(500-600000); ", idx);
+                    errors += e;
+                }
                 idx++;
             }
         }
-        if (changed) { savePreferences(); mqttPublishConfig("applied"); }
+
+        if (changed) {
+            savePreferences();
+            mqttPublishSnapshot("applied");
+        }
         if (errors.length() > 0) {
-            JsonDocument err; err["deviceId"] = DEVICE_ID; err["errors"] = errors;
+            Serial.println("[MQTT] Errors: " + errors);
+            JsonDocument errDoc;
+            errDoc["deviceId"] = DEVICE_ID; errDoc["errors"] = errors;
+            String out; serializeJson(errDoc, out);
+            mqttClient.publish(makeTopic("error").c_str(), out.c_str(), false);
+        }
+    }
+    else if (cmd == "rollback") {
+        if (rollbackPreferences()) mqttPublishSnapshot("rollback-applied");
+        else {
+            JsonDocument err;
+            err["deviceId"] = DEVICE_ID; err["error"] = "no snapshot available";
             String out; serializeJson(err, out);
             mqttClient.publish(makeTopic("error").c_str(), out.c_str(), false);
         }
     }
-    // ── Single params ──
-    else if (cmd == "set-min-money") {
+    else if (cmd == "get-config") {
+        mqttPublishSnapshot("current-config");
+    }
+    else if (cmd == "set-price") {
         int v = doc["value"].as<int>();
         if (v >= 1 && v <= 9999) {
             snapshotPreferences();
-            pref_minStartMoney = v; savePreferences();
-            mqttPublishAck("minStartMoney", v);
+            pref_price = v; savePreferences();
+            Serial.printf("[MQTT] price = %d bath\n", v);
+            mqttPublishAck("price", v);
         }
     }
-    else if (cmd == "set-deduct-rate") {
+    else if (cmd == "set-step-duration") {
+        int s = doc["step"].as<int>();
         int v = doc["value"].as<int>();
-        if (v >= 1 && v <= 1000) {
+        if (s >= 0 && s < NUM_STEPS && v >= 500 && v <= 600000) {
             snapshotPreferences();
-            pref_deductRate = v; savePreferences();
-            mqttPublishAck("deductRate", v);
-        }
-    }
-    else if (cmd == "set-proc-duration") {
-        int proc = doc["proc"].as<int>();
-        int v    = doc["value"].as<int>();
-        if (proc >= 0 && proc < NUM_PROCESSES && v >= 0 && v <= 3600) {
-            snapshotPreferences();
-            pref_procSec[proc] = v; savePreferences();
-            Serial.printf("[MQTT] proc%d duration = %d s\n", proc, v);
+            pref_stepDurationMs[s] = v; savePreferences();
+            Serial.printf("[MQTT] step[%d] = %d ms\n", s, v);
             JsonDocument ack;
-            ack["deviceId"] = DEVICE_ID;
-            ack["proc"]     = proc;
-            ack["duration"] = v;
+            ack["deviceId"] = DEVICE_ID; ack["step"] = s; ack["duration"] = v;
             String out; serializeJson(ack, out);
             mqttClient.publish(makeTopic("ack").c_str(), out.c_str(), false);
         }
     }
-    else if (cmd == "rollback") {
-        if (rollbackPreferences()) mqttPublishConfig("rollback-applied");
-        else {
-            JsonDocument err; err["deviceId"] = DEVICE_ID; err["error"] = "no snapshot";
-            String out; serializeJson(err, out);
-            mqttClient.publish(makeTopic("error").c_str(), out.c_str(), false);
-        }
-    }
-    else if (cmd == "get-config") { mqttPublishConfig("current-config"); }
     else if (cmd == "ble-send") {
         String text = doc["text"].as<String>();
         if (text.length() > 0) sendBLE(text);
     }
-    else { Serial.println("[MQTT] Unknown: " + cmd); }
+    else {
+        Serial.println("[MQTT] Unknown cmd: " + cmd);
+    }
 }
 
 void connectMQTT() {
     if (mqttClient.connected()) return;
-    static unsigned long last = 0;
-    if (millis() - last < 5000) return;
-    last = millis();
+    static unsigned long lastAttempt = 0;
+    if (millis() - lastAttempt < 5000) return;
+    lastAttempt = millis();
     Serial.print(F("[MQTT] Connecting..."));
     String wt = makeTopic("status");
     String wp = "{\"deviceId\":\"" + DEVICE_ID + "\",\"status\":\"offline\"}";
@@ -688,85 +798,199 @@ void handleTelemetry() {
     static unsigned long lastSend = 0;
     if (millis() - lastSend < (unsigned long)pref_telemetrySec * 1000UL) return;
     lastSend = millis();
+
     JsonDocument doc;
-    doc["deviceId"]    = DEVICE_ID;
-    doc["state"]       = stateNames[currentState];
-    doc["money"]       = (int)totalMoney;
-    doc["uptime_s"]    = millis() / 1000;
-    doc["ble"]         = bleClientConnected;
-    doc["minMoney"]    = pref_minStartMoney;
-    doc["deductRate"]  = pref_deductRate;
-    doc["curProcess"]  = currentProcess;
-    doc["waterLevel"]  = waterLevel;
-    doc["sw0"]         = swState[0];
-    doc["sw1"]         = swState[1];
+    doc["deviceId"]   = DEVICE_ID;
+    doc["state"]      = stateNames[currentState];
+    doc["money"]      = (int)totalMoney;
+    doc["price"]      = pref_price;
+    doc["uptime_s"]   = millis() / 1000;
+    doc["ble"]        = bleClientConnected;
+    doc["waterLevel"] = waterLevel;
+    doc["sw0"]        = swState[0];
+    doc["sw1"]        = swState[1];
+    if (currentState == STATE_OPERATION) {
+        doc["currentStep"]   = currentStep + 1;
+        doc["stepRemain_ms"] = (long)pref_stepDurationMs[currentStep]
+                               - (long)(millis() - stepStartTime);
+    }
     JsonArray wls = doc["wl"].to<JsonArray>();
     for (int i = 0; i < NUM_WL_LEVELS; i++) wls.add(wlState[i]);
-    JsonArray procs = doc["processes"].to<JsonArray>();
-    for (int p = 0; p < NUM_PROCESSES; p++) {
-        JsonObject po = procs.add<JsonObject>();
-        po["proc"]     = p;
-        po["duration"] = pref_procSec[p];
-        po["active"]   = (operationRunning && currentProcess == p);
-    }
+    JsonArray steps = doc["stepDurations"].to<JsonArray>();
+    for (int s = 0; s < NUM_STEPS; s++) steps.add(pref_stepDurationMs[s]);
     String out; serializeJson(doc, out);
     mqttClient.publish(makeTopic("telemetry").c_str(), out.c_str(), false);
-    Serial.println(F("[MQTT] Telemetry sent"));
+    Serial.println("[MQTT] Telemetry sent");
 }
 
 // ============================================================
-//  START BUTTON READER — BTN0 (IO7 บน EXP3 0x1E)
+//  BUTTON READER — Single pin (Start)
 // ============================================================
-struct StartButton {
-    bool prevRaw       = false;
-    bool isPressed     = false;
-    bool pressEvent    = false;
-    bool _consumed     = false;
-    unsigned long lastChange  = 0;
-    unsigned long debounceMs  = BTN_DEBOUNCE_MS;
+struct ButtonReader {
+    ButtonReader(const char* n, bool (*fn)())
+        : name(n), readRaw(fn),
+          prevPhysical(false), isPressed(false),
+          pressEvent(false), releaseEvent(false),
+          _consumed(false),
+          holdMs(0), pressedAt(0), lastChange(0),
+          debounceMs(BTN_DEBOUNCE_MS) {}
+
+    const char*   name;
+    bool (*readRaw)();
+    bool          prevPhysical, isPressed;
+    bool          pressEvent, releaseEvent, _consumed;
+    uint32_t      holdMs;
+    unsigned long pressedAt, lastChange, debounceMs;
 
     void update() {
         if (_consumed) { _consumed = false; return; }
-        pressEvent = false;
-        // อ่าน IO7 ของ EXP3 โดยตรง (BTN0 = IO7, Active-LOW)
+        bool raw = readRaw ? readRaw() : false;
+        unsigned long now = millis();
+        if (raw != prevPhysical) { lastChange = now; prevPhysical = raw; }
+        if (now - lastChange < debounceMs) return;
+        if (prevPhysical && !isPressed) {
+            isPressed = true; pressedAt = now; pressEvent = true;
+            Serial.printf("[BTN][%8lu ms] %s PRESS\n", now, name);
+        } else if (!prevPhysical && isPressed) {
+            holdMs = (uint32_t)(now - pressedAt);
+            isPressed = false; releaseEvent = true;
+            Serial.printf("[BTN][%8lu ms] %s RELEASE held=%lu ms\n",
+                now, name, (unsigned long)holdMs);
+        }
+    }
+    void injectPress() {
+        pressEvent = true; _consumed = true;
+        Serial.printf("[BTN][%8lu ms] %s PRESS (sim)\n",
+            (unsigned long)millis(), name);
+    }
+};
+
+// ============================================================
+//  MULTI-PIN BUTTON READER — EXP3 (0x1E)
+//  กดปุ่มไหนก็ได้ → anyPressEvent=true
+// ============================================================
+struct MultiPinButtonReader {
+    uint8_t  prevRaw, stableRaw, pressedPins;
+    bool     anyPressEvent;
+    uint8_t  pressedPin;
+    bool     _consumed;
+    unsigned long lastChangeTime, debounceMs;
+
+    MultiPinButtonReader()
+        : prevRaw(0xFF), stableRaw(0xFF), pressedPins(0),
+          anyPressEvent(false), pressedPin(0), _consumed(false),
+          lastChangeTime(0), debounceMs(BTN_DEBOUNCE_MS) {}
+
+    uint8_t readByte() {
         Wire.beginTransmission(0x1E);
         Wire.write(0x00);
         Wire.endTransmission(false);
         Wire.requestFrom((uint8_t)0x1E, (uint8_t)1);
-        uint8_t raw = Wire.available() ? Wire.read() : 0xFF;
-        bool pressed = !(raw & (1 << BTN0_PHYSICAL_IO));
+        return Wire.available() ? Wire.read() : 0xFF;
+    }
 
+    void update() {
+        if (_consumed) { _consumed = false; return; }
+        uint8_t raw = readByte();
         unsigned long now = millis();
-        if (pressed != prevRaw) { lastChange = now; prevRaw = pressed; }
-        if (now - lastChange < debounceMs) return;
+        if (raw != prevRaw) { lastChangeTime = now; prevRaw = raw; }
+        if (now - lastChangeTime < debounceMs) return;
+        uint8_t changed = stableRaw ^ raw;
+        stableRaw = raw;
+        if (!changed) return;
 
-        if (prevRaw && !isPressed) {
-            isPressed = true; pressEvent = true;
-            Serial.printf("[BTN0][%8lu ms] START PRESS\n", now);
-        } else if (!prevRaw && isPressed) {
-            isPressed = false;
-            Serial.printf("[BTN0][%8lu ms] START RELEASE\n", now);
+        for (uint8_t p = 0; p < 8; p++) {
+            if (!(changed & (1<<p))) continue;
+            bool gnd = !(raw & (1<<p));
+            uint8_t logicalCh = BTN_LOGICAL[p];
+            if (gnd && !(pressedPins & (1<<p))) {
+                pressedPins  |= (1<<p);
+                anyPressEvent = true;
+                pressedPin    = logicalCh;
+                Serial.printf("[BTN][%8lu ms] BTN%d PRESS (IO%d, EXP3 0x1E)\n",
+                    now, logicalCh, p);
+            } else if (!gnd && (pressedPins & (1<<p))) {
+                pressedPins &= ~(1<<p);
+                Serial.printf("[BTN][%8lu ms] BTN%d RELEASE (IO%d, EXP3 0x1E)\n",
+                    now, logicalCh, p);
+            }
         }
     }
 
-    void injectPress() {
-        pressEvent = true; _consumed = true;
-        Serial.printf("[BTN0][%8lu ms] START PRESS (sim)\n", (unsigned long)millis());
+    void injectPress(uint8_t logicalCh = 0) {
+        anyPressEvent = true; pressedPin = logicalCh; _consumed = true;
+        Serial.printf("[BTN][%8lu ms] BTN%d PRESS (sim)\n",
+            (unsigned long)millis(), logicalCh);
     }
-} btnStart;
+};
+
+bool rawStart() { return false; }
+ButtonReader         btnStart("START", rawStart);
+MultiPinButtonReader btnAny;
+
+const char* waterLevelDesc(int level) {
+    switch (level) {
+        case 1: return "Tank1 >50%"; case 2: return "Tank1 >25%";
+        case 3: return "Tank2 >50%"; case 4: return "Tank2 >25%";
+        case 5: return "Tank3 >50%"; case 6: return "Tank3 >25%";
+        default: return "All <25%";
+    }
+}
+
+// Forward declaration
+void doSummaryAndReset();
 
 // ============================================================
-//  UPDATE BUTTONS
+//  Pi UART READER
 // ============================================================
-static unsigned long lastBtnPoll = 0;
+void readPi() {
+    while (PiSerial.available()) {
+        String line = PiSerial.readStringUntil('\n');
+        line.trim();
+        if (line.isEmpty()) continue;
+        Serial.println("[PI>>] " + line);
+        JsonDocument doc;
+        if (deserializeJson(doc, line)) continue;
+        String cmd = doc["cmd"].as<String>();
 
-void updateButtons() {
-    if (dbg_pressStart) { btnStart.injectPress(); dbg_pressStart = false; return; }
-    btnStart.pressEvent = false;
-    unsigned long now = millis();
-    if (now - lastBtnPoll < BTN_POLL_MS) return;
-    lastBtnPoll = now;
-    btnStart.update();
+        if (cmd == "start") {
+            // Pi confirm payment (เช่น QR สำเร็จ) → กด Start แทนผู้ใช้
+            if (currentState == STATE_PAYMENT_CHECK) {
+                bankReader.disable(); coinReader.disable();
+                addLog("INITIALIZE_PI"); transitionTo(STATE_READY);
+            }
+        }
+        else if (cmd == "finish") {
+            if (currentState == STATE_OPERATION) {
+                allRelaysOff(); allLEDsOff();
+                addLog("FINISH_PI");
+                transitionTo(STATE_SUMMARY);
+            } else if (currentState == STATE_SUMMARY) {
+                doSummaryAndReset();
+            }
+        }
+        else if (cmd == "pay_qr") {
+            int amt = doc["amount"].as<int>();
+            if (amt <= 0) amt = pref_price;
+            String link = "https://catcarwash.example.com/pay?id=" + DEVICE_ID + "&amt=" + String(amt);
+            JsonDocument _qd; _qd["evt"] = "qr_link"; _qd["url"] = link; sendPi(_qd);
+            Serial.println("[PI] QR: " + link);
+        }
+        else if (cmd == "get_status") {
+            sendPiState(stateNames[currentState]);
+            sendPiMoney();
+            if (currentState == STATE_OPERATION) sendPiStep(currentStep + 1);
+        }
+        else if (cmd == "ping") {
+            JsonDocument _d;
+            _d["evt"]     = "pong";
+            _d["state"]   = stateNames[currentState];
+            _d["balance"] = (int)totalMoney;
+            _d["price"]   = pref_price;
+            if (currentState == STATE_OPERATION) _d["step"] = currentStep + 1;
+            sendPi(_d);
+        }
+    }
 }
 
 // ============================================================
@@ -777,17 +1001,54 @@ void checkMoneyInput() {
     lastMoneyCheck = millis();
     float bk = bankReader.checkAmount();
     float co = coinReader.checkAmount();
-    if (dbg_addMoney) { bk += dbg_addAmount; dbg_addMoney=false; dbg_addAmount=0; }
+    if (dbg_addMoney) { bk += dbg_addAmount; dbg_addMoney = false; dbg_addAmount = 0; }
     if (bk > 0) {
         totalMoney += bk;
         display.showNumberDec((int)totalMoney, false, 4, 0);
         addLog("INSERT_BANK", (uint32_t)bk);
+        sendPiMoney();
     }
     if (co > 0) {
         totalMoney += co;
         display.showNumberDec((int)totalMoney, false, 4, 0);
         addLog("INSERT_COIN", (uint32_t)co);
+        sendPiMoney();
     }
+    // Real-time preview ขณะ pulse ยังไม่ timeout
+    static int lastSentPreview = -1;
+    float pending = bankReader.getPendingAmount() + coinReader.getPendingAmount();
+    if (pending > 0) {
+        int previewTotal = (int)(totalMoney + pending);
+        display.showNumberDec(previewTotal, false, 4, 0);
+        if (previewTotal != lastSentPreview) {
+            lastSentPreview = previewTotal;
+            JsonDocument _pd;
+            _pd["evt"] = "money"; _pd["balance"] = previewTotal; _pd["price"] = pref_price;
+            sendPi(_pd);
+        }
+    } else {
+        lastSentPreview = -1;
+    }
+}
+
+// ============================================================
+//  UPDATE BUTTONS
+// ============================================================
+static unsigned long lastBtnPoll = 0;
+
+void updateButtons() {
+    if (dbg_pressStart) { btnStart.injectPress(); dbg_pressStart = false; return; }
+
+    btnStart.pressEvent   = false;
+    btnStart.releaseEvent = false;
+    btnAny.anyPressEvent  = false;
+
+    unsigned long now = millis();
+    if (now - lastBtnPoll < BTN_POLL_MS) return;
+    lastBtnPoll = now;
+
+    btnStart.update();
+    btnAny.update();
 }
 
 // ============================================================
@@ -802,96 +1063,128 @@ void handleSerial() {
 
     if (up.startsWith("ADD ")) {
         float v = cmd.substring(4).toFloat();
-        if (v > 0) { dbg_addMoney=true; dbg_addAmount=v; Serial.printf("[CMD] +%.0f bath\n",v); }
+        if (v > 0) { dbg_addMoney = true; dbg_addAmount = v;
+                     Serial.printf("[CMD] +%.0f bath\n", v); }
     }
     else if (up == "START") { dbg_pressStart = true; }
     else if (up == "STATUS") {
-        Serial.println(F("──────────────────────────────────────────"));
-        Serial.printf("  State      : %s\n", stateNames[currentState]);
-        Serial.printf("  Money      : %.0f bath\n", totalMoney);
-        Serial.printf("  Process    : %d/%d %s\n",
-            currentProcess, NUM_PROCESSES-1, operationRunning?"(running)":"(idle)");
-        Serial.printf("  WiFi       : %s\n", WiFi.status()==WL_CONNECTED?WiFi.localIP().toString().c_str():"offline");
-        Serial.printf("  MQTT       : %s\n", mqttClient.connected()?"OK":"offline");
-        Serial.printf("  BLE        : %s\n", bleClientConnected?"connected":"no client");
-        Serial.println(F("  ── Preferences ──────────────────────────────"));
-        Serial.printf("  minStartMoney  = %d bath\n",   pref_minStartMoney);
-        Serial.printf("  deductRate     = %d bath/s\n",  pref_deductRate);
-        Serial.printf("  readyCountdown = %d s\n",       pref_readyCountdown);
-        Serial.print( "  processDurations = [");
-        for (int p = 0; p < NUM_PROCESSES; p++)
-            Serial.printf("%d%s", pref_procSec[p], p<7?",":"]");
-        Serial.println(F(" sec"));
-        Serial.println(F("  ── Water Level ───────────────────────────────"));
-        Serial.printf("  Level=%d/6 | SW0=%d SW1=%d\n", waterLevel, swState[0], swState[1]);
-        Serial.println(F("──────────────────────────────────────────"));
+        Serial.println(F("─────────────────────────────────────────────"));
+        Serial.printf("  State     : %s\n", stateNames[currentState]);
+        Serial.printf("  Money     : %.0f / %d bath\n", totalMoney, pref_price);
+        if (currentState == STATE_OPERATION)
+            Serial.printf("  Step      : %d/%d | Remain: %ld ms\n",
+                currentStep+1, NUM_STEPS,
+                (long)pref_stepDurationMs[currentStep] - (long)(millis() - stepStartTime));
+        Serial.printf("  WiFi      : %s\n",
+            WiFi.status()==WL_CONNECTED ? WiFi.localIP().toString().c_str() : "offline");
+        Serial.printf("  MQTT      : %s\n", mqttClient.connected()?"OK":"offline");
+        Serial.printf("  BLE       : %s\n", bleClientConnected?"connected":"no client");
+        Serial.println(F("  ── Money Readers ─────────────────────────────"));
+        Serial.printf("  Bank: min=%dms max=%dms timeout=%dms | pending=%d pulses\n",
+            BANK_MIN_PULSE_MS, BANK_MAX_PULSE_MS, BANK_PULSE_TIMEOUT_MS,
+            bankReader.getPulseCount());
+        Serial.printf("  Coin: min=%dms max=%dms timeout=%dms | pending=%d pulses\n",
+            COIN_MIN_PULSE_MS, COIN_MAX_PULSE_MS, COIN_PULSE_TIMEOUT_MS,
+            coinReader.getPulseCount());
+        Serial.println(F("  ── Water Level (EXP4 0x1F) ───────────────────"));
+        Serial.printf("  Level=%d/6 | ", waterLevel);
+        for (int i = 5; i >= 0; i--)
+            Serial.printf("WL%d=%s ", i, wlState[i] ? "ON" : "--");
+        Serial.println();
+        Serial.printf("  SW0=%s  SW1=%s\n",
+            swState[0] ? "ON" : "OFF", swState[1] ? "ON" : "OFF");
+        Serial.println(F("  ── Light Sensor ──────────────────────────────"));
+        Serial.printf("  Pin=%d | ADC=%d | brightness=%d%% | detected=%s\n",
+            PIN_LIGHT_SENSOR,
+            lightSensor.rawADC(),
+            lightSensor.brightness(),
+            lightSensor.detected() ? "YES (light ON)" : "NO (dark)");
+        Serial.println(F("  ── Preferences ───────────────────────────────"));
+        Serial.printf("  price          = %d bath\n", pref_price);
+        Serial.printf("  readyCountdown = %d s\n",    pref_readyCountdown);
+        Serial.printf("  telemetrySec   = %d s\n",    pref_telemetrySec);
+        Serial.println(F("  ── Step Durations ────────────────────────────"));
+        for (int s = 0; s < NUM_STEPS; s++)
+            Serial.printf("  Step%d → LD%d : %d ms\n", s+1, s, pref_stepDurationMs[s]);
+        Serial.println(F("─────────────────────────────────────────────"));
     }
     else if (up == "LOG")  { printSummary(); }
     else if (up.startsWith("SET ")) {
-        int s = cmd.indexOf(' ', 4); if (s<0) return;
-        String key = cmd.substring(4,s); key.toLowerCase();
-        int val = cmd.substring(s+1).toInt();
-        if      (key == "minmoney")     pref_minStartMoney  = val;
-        else if (key == "deductrate")   pref_deductRate     = val;
+        int sp = cmd.indexOf(' ', 4); if (sp < 0) return;
+        String key = cmd.substring(4, sp); key.toLowerCase();
+        int val = cmd.substring(sp+1).toInt();
+        bool saved = true;
+        if      (key == "price")        pref_price          = val;
         else if (key == "countdown")    pref_readyCountdown = val;
         else if (key == "telemetrysec") pref_telemetrySec   = val;
-        else if (key.startsWith("proc") && key.length()==5) {
-            int p = key.charAt(4) - '0';
-            if (p>=0 && p<NUM_PROCESSES) pref_procSec[p] = val;
-            else { Serial.println(F("[CMD] Invalid proc index")); return; }
+        else if (key.startsWith("step") && key.length() == 5) {
+            int s = key.charAt(4) - '0';
+            if (s >= 0 && s < NUM_STEPS) pref_stepDurationMs[s] = val;
+            else { Serial.println(F("[CMD] Invalid step index (0-5)")); saved = false; }
         }
-        else { Serial.println(F("[CMD] Unknown key")); return; }
-        savePreferences();
-        Serial.printf("[SET] %s = %d\n", key.c_str(), val);
+        else { Serial.println(F("[CMD] Unknown key")); saved = false; }
+        if (saved) { savePreferences();
+                     Serial.printf("[SET] %s = %d\n", key.c_str(), val); }
     }
     else if (up.startsWith("BLE ")) { sendBLE(cmd.substring(4)); }
     else if (up == "SCAN") {
-        Serial.println(F("[SCAN] I2C..."));
-        for (uint8_t a=1;a<127;a++) {
+        Serial.println(F("[SCAN] I2C bus..."));
+        uint8_t found = 0;
+        for (uint8_t a = 1; a < 127; a++) {
             Wire.beginTransmission(a);
-            if (Wire.endTransmission()==0) Serial.printf("[SCAN] 0x%02X\n",a);
+            if (Wire.endTransmission() == 0) { Serial.printf("[SCAN] 0x%02X\n", a); found++; }
         }
+        Serial.printf("[SCAN] %d device(s)\n", found);
     }
     else if (up == "PINREAD") {
-        uint8_t addrs[4]={0x18,0x1C,0x1E,0x1F};
-        const char* roles[4]={"LOAD","LED","BTN","WL+SW"};
-        for(int e=0;e<4;e++){
-            Wire.beginTransmission(addrs[e]);Wire.write(0x00);
-            Wire.endTransmission(false);Wire.requestFrom(addrs[e],(uint8_t)1);
-            uint8_t r=Wire.available()?Wire.read():0xFF;
-            Serial.printf("[PIN] 0x%02X %-7s = 0b",addrs[e],roles[e]);
-            for(int b=7;b>=0;b--)Serial.print((r>>b)&1);
-            Serial.printf(" (0x%02X)\n",r);
+        uint8_t addrs[4] = {0x18,0x1C,0x1E,0x1F};
+        const char* roles[4] = {"LOAD(LD0-7)","LED(LED0-7)","BTN(BTN0-7)","WL+SW"};
+        for (int e = 0; e < 4; e++) {
+            Wire.beginTransmission(addrs[e]); Wire.write(0x00);
+            Wire.endTransmission(false); Wire.requestFrom(addrs[e],(uint8_t)1);
+            uint8_t r = Wire.available() ? Wire.read() : 0xFF;
+            Serial.printf("[PIN] 0x%02X %-14s = 0b", addrs[e], roles[e]);
+            for (int b = 7; b >= 0; b--) Serial.print((r>>b)&1);
+            Serial.printf(" (0x%02X)\n", r);
         }
-        Serial.printf("[PIN] BTN0=%s | WaterLevel=%d\n",
-            btnStart.isPressed?"PRESSED":"released", waterLevel);
+        Serial.printf("[PIN] WaterLevel=%d/6 | SW0=%d SW1=%d\n",
+            waterLevel, swState[0], swState[1]);
     }
-    else if (up == "VERBOSE ON")  { dbg_verbose=true;  Serial.println(F("[VRB] ON")); }
-    else if (up == "VERBOSE OFF") { dbg_verbose=false; Serial.println(F("[VRB] OFF")); }
+    else if (up == "VERBOSE ON")  { dbg_verbose = true;  Serial.println(F("[VRB] ON")); }
+    else if (up == "VERBOSE OFF") { dbg_verbose = false; Serial.println(F("[VRB] OFF")); }
     else if (up == "RESET PREFS") { resetPreferences(); }
     else if (up.startsWith("GOTO ")) {
-        int st=cmd.substring(5).toInt();
-        if (st>=0&&st<=7) transitionTo((SystemState)st);
+        int st = cmd.substring(5).toInt();
+        if (st >= 0 && st <= 7) transitionTo((SystemState)st);
     }
     else if (up == "HELP") {
-        Serial.println(F("══════════════ CATPAW Serial Commands ══════════════"));
-        Serial.println(F("  ADD <n>             เพิ่มเงิน n บาท"));
-        Serial.println(F("  START               จำลองกดปุ่ม Start (BTN0)"));
-        Serial.println(F("  STATUS              ดูสถานะทั้งหมด"));
-        Serial.println(F("  LOG                 ดู session log"));
-        Serial.println(F("  BLE <text>          ส่งข้อความไป CYD"));
-        Serial.println(F("  SET minMoney <n>    เงินขั้นต่ำ (บาท)"));
-        Serial.println(F("  SET deductRate <n>  อัตราหักเงิน (บาท/วิ)"));
-        Serial.println(F("  SET proc0..7 <n>    ระยะเวลา Process (วิ)"));
-        Serial.println(F("  SET countdown <n>   นับถอยหลัง (วิ)"));
-        Serial.println(F("  SET telemetrySec <n>"));
-        Serial.println(F("  SCAN / PINREAD / VERBOSE ON/OFF"));
-        Serial.println(F("  RESET PREFS / GOTO <0-7>"));
-        Serial.println(F("══════════════════════════════════════════════════"));
-        Serial.println(F("  MQTT: set-params, set-min-money, set-deduct-rate,"));
-        Serial.println(F("        set-proc-duration, rollback, get-config,"));
-        Serial.println(F("        ble-send, reboot"));
-        Serial.println(F("══════════════════════════════════════════════════"));
+        Serial.println(F("══════════════════════ Serial Commands ═══════════════════════"));
+        Serial.println(F("  ADD <n>              เพิ่มเงิน n บาท (sim)"));
+        Serial.println(F("  START                จำลองกดปุ่ม Start"));
+        Serial.println(F("  STATUS               ดูสถานะครบ"));
+        Serial.println(F("  LOG                  ดู session log"));
+        Serial.println(F("  BLE <text>           ส่งข้อความไปแสดง QR บน CYD"));
+        Serial.println(F("  ── Preferences (บันทึก NVS ทันที) ──────────────────────────"));
+        Serial.println(F("  SET price <n>        ราคา fix (บาท)"));
+        Serial.println(F("  SET step0..5 <ms>    ระยะเวลาแต่ละ step (ms)"));
+        Serial.println(F("  SET countdown <n>    นับถอยหลัง (วิ)"));
+        Serial.println(F("  SET telemetrySec <n> Telemetry interval (วิ)"));
+        Serial.println(F("  RESET PREFS          คืนค่า default ทั้งหมด"));
+        Serial.println(F("  ── Debug ─────────────────────────────────────────────────"));
+        Serial.println(F("  SCAN                 สแกน I2C bus"));
+        Serial.println(F("  PINREAD              อ่านค่า pin register ทุก expander"));
+        Serial.println(F("  VERBOSE ON/OFF       raw EXP3 byte ทุก 500ms"));
+        Serial.println(F("  GOTO <0-7>           บังคับเปลี่ยน state"));
+        Serial.println(F("═════════════════════════════════════════════════════════════"));
+        Serial.println(F("  ── MQTT Commands ──────────────────────────────────────────"));
+        Serial.println(F("  {\"cmd\":\"set-price\",\"value\":20}"));
+        Serial.println(F("  {\"cmd\":\"set-step-duration\",\"step\":0,\"value\":5000}"));
+        Serial.println(F("  {\"cmd\":\"set-params\",\"price\":20,\"stepDurations\":[5000,8000,6000,7000,10000,5000]}"));
+        Serial.println(F("  {\"cmd\":\"get-config\"}"));
+        Serial.println(F("  {\"cmd\":\"rollback\"}"));
+        Serial.println(F("  {\"cmd\":\"reboot\"}"));
+        Serial.println(F("  {\"cmd\":\"ble-send\",\"text\":\"https://...\"}"));
+        Serial.println(F("═════════════════════════════════════════════════════════════"));
     }
     else { Serial.println(F("[CMD] Unknown. Type HELP")); }
 }
@@ -903,45 +1196,53 @@ void handleSerial() {
 void handleBoot() {
     if (!stateChanged) return;
     stateChanged = false;
-    Serial.println(F("[BOOT] CATPAW hardware check..."));
+    Serial.println(F("[BOOT] Hardware check..."));
 
     uint8_t seg8[] = {0x7F,0x7F,0x7F,0x7F};
-    display.setSegments(seg8); delay(400);
+    display.setSegments(seg8);
+    delay(400);
 
     bool ok[4] = {
         expander1.begin(), expander2.begin(),
         expander3.begin(), expander4.begin()
     };
     uint8_t exAddr[4] = {0x18,0x1C,0x1E,0x1F};
-    const char* exRole[4] = {"LOAD","LED","BTN","WL+SW"};
-    for (int i=0;i<4;i++)
-        Serial.printf("[BOOT] EXP 0x%02X %-6s : %s\n",
-            exAddr[i], exRole[i], ok[i]?"OK":"FAIL");
+    const char* exRole[4] = {"OUT-Relay","OUT-LED","IN-BTN","IN-WL"};
+    for (int i = 0; i < 4; i++)
+        Serial.printf("[BOOT] EXP 0x%02X %-12s : %s\n",
+            exAddr[i], exRole[i], ok[i] ? "OK" : "FAIL");
 
     if (!ok[0]||!ok[1]||!ok[2]||!ok[3]) {
         transitionTo(STATE_LOCKED); return;
     }
 
-    // Output: เขียน LOW ก่อน → OUTPUT
-    for (uint8_t p=0;p<8;p++) {
-        expander1.digitalWrite(p,LOW);
-        expander2.digitalWrite(p,LOW);
+    bool exp5ok = expander5.begin();
+    Serial.printf("[BOOT] EXP 0x%02X %-12s : %s\n", EXP5_ADDR, "IN-Extra",
+        exp5ok ? "OK" : "FAIL (optional)");
+    if (exp5ok) {
+        for (uint8_t p = 0; p < 6; p++) expander5.pinMode(p, INPUT);
     }
-    for (uint8_t p=0;p<8;p++) {
-        expander1.pinMode(p,OUTPUT);
-        expander2.pinMode(p,OUTPUT);
-    }
-    // Input
-    for (uint8_t p=0;p<8;p++) {
-        expander3.pinMode(p,INPUT);
-        expander4.pinMode(p,INPUT);
-    }
-    Serial.println(F("[BOOT] LOAD/LED=OUTPUT  BTN/WL=INPUT"));
 
-    pinMode(PIN_BANK_PULSE,INPUT_PULLUP);
-    pinMode(PIN_COIN_PULSE,INPUT_PULLUP);
+    for (uint8_t p = 0; p < 8; p++) {
+        expander1.digitalWrite(p, LOW);
+        expander2.digitalWrite(p, LOW);
+    }
+    for (uint8_t p = 0; p < 8; p++) {
+        expander1.pinMode(p, OUTPUT);
+        expander2.pinMode(p, OUTPUT);
+    }
+    for (uint8_t p = 0; p < 8; p++) {
+        expander3.pinMode(p, INPUT);
+        expander4.pinMode(p, INPUT);
+    }
+    Serial.println(F("[BOOT] LOAD/LED=OUTPUT(LOW)  BTN/WL=INPUT"));
+
+    pinMode(PIN_BANK_PULSE, INPUT_PULLUP);
+    pinMode(PIN_COIN_PULSE, INPUT_PULLUP);
     attachInterrupt(digitalPinToInterrupt(PIN_BANK_PULSE), bankISR, CHANGE);
     attachInterrupt(digitalPinToInterrupt(PIN_COIN_PULSE), coinISR, CHANGE);
+    Serial.println(F("[BOOT] ISR attached (CHANGE mode — pulse width validation)"));
+
     lightSensor.begin();
 
     display.showNumberDec(100, false, 4, 0);
@@ -950,6 +1251,7 @@ void handleBoot() {
     transitionTo(STATE_IDLE);
 }
 
+// ── IDLE: รอรับเงินจนครบ pref_price ──
 void handleIdle() {
     if (stateChanged) {
         stateChanged = false;
@@ -957,37 +1259,55 @@ void handleIdle() {
         display.showNumberDec(0, false, 4, 0);
         bankReader.enable();
         coinReader.enable();
-        Serial.printf("[IDLE] Waiting money >= %d bath\n", pref_minStartMoney);
+        Serial.printf("[IDLE] Waiting money >= %d bath (price)\n", pref_price);
+        sendPiMoney();
     }
 
+    // Process MQTT deferred commands หลัง IDLE นาน 5 นาที
+    if (millis() - stateEnterTime > MQTT_DEFER_IDLE_MS) {
+        mqttProcessQueue();
+    }
+
+    // Light Sensor
     lightSensor.update();
-    static bool prevLight = false;
+    static bool prevLightState = false;
     bool nowLight = lightSensor.detected();
-    if (nowLight != prevLight) {
-        prevLight = nowLight;
+    if (nowLight != prevLightState) {
+        prevLightState = nowLight;
         Serial.printf("[LIGHT] %s | ADC=%d brightness=%d%%\n",
-            nowLight?"DETECTED":"not detected",
+            nowLight ? "DETECTED (light ON)" : "NOT detected (dark)",
             lightSensor.rawADC(), lightSensor.brightness());
     }
 
-    static unsigned long lastWL = 0;
-    if (millis()-lastWL >= 200) { lastWL = millis(); updateWaterLevel(); }
+    // Water Level
+    static unsigned long lastWLCheck = 0;
+    if (millis() - lastWLCheck >= 200) {
+        lastWLCheck = millis();
+        updateWaterLevel();
+    }
 
     checkMoneyInput();
-    if (totalMoney >= (float)pref_minStartMoney)
+
+    // เงินครบราคา → ไป PAYMENT_CHECK
+    if (totalMoney >= (float)pref_price)
         transitionTo(STATE_PAYMENT_CHECK);
 }
 
+// ── PAYMENT_CHECK: เงินครบแล้ว รอกด Start ──
 void handlePaymentCheck() {
     if (stateChanged) {
         stateChanged = false;
-        Serial.printf("[PAY] %.0f >= %d bath — press BTN0 (START)\n",
-            totalMoney, pref_minStartMoney);
-        String qr = "catpaw://" + DEVICE_ID + "?amt=" + String((int)totalMoney);
+        Serial.printf("[PAY] %.0f >= %d bath — press START\n",
+            totalMoney, pref_price);
+        // ส่ง QR แสดงยอดและ device ไป CYD
+        String qr = "vend://" + DEVICE_ID + "?amt=" + String((int)totalMoney);
         sendBLE(qr);
     }
+    // ยังรับเงินเพิ่มได้ (เกินราคาก็ไม่เป็นไร)
     checkMoneyInput();
-    if (btnStart.pressEvent) {
+
+    // กด BTN ไหนก็ได้ หรือ Serial START → เริ่ม
+    if (btnAny.anyPressEvent || btnStart.pressEvent) {
         bankReader.disable();
         coinReader.disable();
         addLog("INITIALIZE");
@@ -995,191 +1315,157 @@ void handlePaymentCheck() {
     }
 }
 
+// ── READY: นับถอยหลังก่อน OPERATION ──
 void handleReady() {
     if (stateChanged) {
         stateChanged       = false;
         countdownRemaining = pref_readyCountdown;
         lastCountdownTick  = millis();
         display.showNumberDec(countdownRemaining, false, 4, 0);
-        Serial.printf("[READY] Countdown: %d\n", countdownRemaining);
-        addLog("COUNTDOWN_START");
-        return;
+        Serial.printf("[READY] Countdown %d s\n", countdownRemaining);
+        String qr = "vend://" + DEVICE_ID + "/start?price=" + String(pref_price);
+        sendBLE(qr);
     }
-    if (countdownRemaining > 0 && millis()-lastCountdownTick >= 1000) {
-        lastCountdownTick = millis();
+
+    unsigned long now = millis();
+    if (now - lastCountdownTick >= 1000) {
+        lastCountdownTick = now;
         countdownRemaining--;
         if (countdownRemaining > 0) {
             display.showNumberDec(countdownRemaining, false, 4, 0);
             Serial.printf("[READY] %d...\n", countdownRemaining);
         } else {
-            display.showNumberDec((int)totalMoney, false, 4, 0);
-            addLog("COUNTDOWN_END");
-            Serial.println(F("[READY] GO! Starting process sequence..."));
+            display.showNumberDec(0, false, 4, 0);
+            Serial.println(F("[READY] GO!"));
             transitionTo(STATE_OPERATION);
         }
     }
 }
 
-// ── OPERATION: Sequential Process ──────────────────────────
-// ไล่ Process 0→7
-// แต่ละ Process: LED[n]+LD[n] ON นาน pref_procSec[n] วิ
-// ข้าม Process ที่ duration=0
-// หักเงิน pref_deductRate บาทต่อวิ ตลอดเวลา
+// ── OPERATION: รัน 6 Step อัตโนมัติ (ไม่มี topup) ──
 void handleOperation() {
     if (stateChanged) {
-        stateChanged     = false;
-        currentProcess   = 0;
-        operationRunning = false;
-        lastDeductTime   = millis();
-        lastDisplayRefresh = millis();
-        memset(procActualMs, 0, sizeof(procActualMs));
-        // หา process แรกที่ duration > 0
-        while (currentProcess < NUM_PROCESSES && pref_procSec[currentProcess] == 0)
-            currentProcess++;
-        if (currentProcess >= NUM_PROCESSES) {
-            Serial.println(F("[OP] All processes skipped (duration=0) → SUMMARY"));
-            transitionTo(STATE_SUMMARY);
-            return;
-        }
-        setProcess(currentProcess, true);
-        processStartTime = millis();
-        operationRunning = true;
-        char label[24]; snprintf(label,sizeof(label),"PROC%d_START",currentProcess);
-        addLog(label);
-        Serial.printf("[OP] PROC%d started | duration=%ds | Money:%.0f\n",
-            currentProcess, pref_procSec[currentProcess], totalMoney);
-    }
+        stateChanged  = false;
+        currentStep   = 0;
+        stepStartTime = millis();
 
-    unsigned long now = millis();
+        allRelaysOff(); allLEDsOff();
 
-    // ── หักเงิน 1 บาท/วิ ──
-    if (now - lastDeductTime >= 1000) {
-        lastDeductTime = now;
-        totalMoney -= (float)pref_deductRate;
-        if (totalMoney < 0.0f) totalMoney = 0.0f;
-        display.showNumberDec((int)totalMoney, false, 4, 0);
-        lastDisplayRefresh = now;
-        Serial.printf("[OP] -1 bath | Left: %.0f bath\n", totalMoney);
+        // เริ่ม Step 1 → LD0
+        setChannelRelay(0, true);
+        setLED(0, true);
+        display.showNumberDec(1, false, 4, 0);
 
-        if (totalMoney <= 0.0f) {
-            // เงินหมดกลางคัน
-            uint32_t elapsed = (uint32_t)(now - processStartTime);
-            procActualMs[currentProcess] += elapsed;
-            char label[24]; snprintf(label,sizeof(label),"PROC%d_MONEY_EMPTY",currentProcess);
-            addLog(label, elapsed);
-            setProcess(currentProcess, false);
-            allOff();
-            operationRunning = false;
-            display.showNumberDec(0, false, 4, 0);
-            Serial.println(F("[OP] Money depleted → SUMMARY"));
-            transitionTo(STATE_SUMMARY);
-            return;
-        }
-    }
+        Serial.println(F("[OP] OPERATION started — 6 fixed steps"));
+        Serial.printf( "[OP] Step 1/%d → LD0 ON | duration=%d ms\n",
+            NUM_STEPS, pref_stepDurationMs[0]);
+        addLog("STEP_1_START");
+        sendPiStep(1);
 
-    // ── ตรวจว่า Process ปัจจุบันครบเวลาหรือยัง ──
-    unsigned long procElapsed = now - processStartTime;
-    if (procElapsed >= (unsigned long)pref_procSec[currentProcess] * 1000UL) {
-        procActualMs[currentProcess] = procElapsed;
-        char label[24]; snprintf(label,sizeof(label),"PROC%d_DONE",currentProcess);
-        addLog(label, procElapsed);
-        setProcess(currentProcess, false);
-        Serial.printf("[OP] PROC%d done | actual=%lums\n",
-            currentProcess, (unsigned long)procElapsed);
-
-        // ── หา Process ถัดไป (ข้ามที่ duration=0) ──
-        currentProcess++;
-        while (currentProcess < NUM_PROCESSES && pref_procSec[currentProcess] == 0)
-            currentProcess++;
-
-        if (currentProcess >= NUM_PROCESSES) {
-            // รันครบทุก Process แล้ว
-            operationRunning = false;
-            allOff();
-            Serial.println(F("[OP] All processes complete → SUMMARY"));
-            transitionTo(STATE_SUMMARY);
-            return;
-        }
-
-        // เริ่ม Process ถัดไป
-        setProcess(currentProcess, true);
-        processStartTime = millis();
-        snprintf(label, sizeof(label), "PROC%d_START", currentProcess);
-        addLog(label);
-        Serial.printf("[OP] PROC%d started | duration=%ds | Money:%.0f\n",
-            currentProcess, pref_procSec[currentProcess], totalMoney);
-    }
-
-    // ── Display refresh ทุก 1 วิ ──
-    if (now - lastDisplayRefresh >= 1000) {
-        lastDisplayRefresh = now;
-        display.showNumberDec((int)totalMoney, false, 4, 0);
-    }
-
-    // ── Top-up debug ──
-    if (dbg_addMoney) {
-        totalMoney += dbg_addAmount;
-        addLog("TOPUP", (uint32_t)dbg_addAmount);
-        Serial.printf("[OP] +%.0f bath | Total: %.0f\n", dbg_addAmount, totalMoney);
-        dbg_addMoney = false; dbg_addAmount = 0.0f;
-        display.showNumberDec((int)totalMoney, false, 4, 0);
-    }
-}
-
-void handleSummary() {
-    if (stateChanged) {
-        stateChanged = false;
-        operationRunning = false;
-        allOff();
-        display.showNumberDec(0, false, 4, 0);
-        // สรุป process
-        Serial.println(F("[SUMMARY] Process results:"));
-        for (int p = 0; p < NUM_PROCESSES; p++) {
-            if (pref_procSec[p] == 0) continue;
-            Serial.printf("  PROC%d: config=%ds actual=%lums\n",
-                p, pref_procSec[p], (unsigned long)procActualMs[p]);
-        }
-        Serial.printf("[SUMMARY] WaterLevel=%d/6 | Money left=%.0f\n",
-            waterLevel, totalMoney);
-        String qr = "catpaw://" + DEVICE_ID + "/done";
-        sendBLE(qr);
-        Serial.println(F("[SUMMARY] Press BTN0 to view log & reset"));
-    }
-    if (btnStart.pressEvent) {
-        addLog("SUMMARY_VIEW");
-        printSummary();
-        // Publish session summary
+        // Publish session_start ไป MQTT
         if (mqttClient.connected()) {
             JsonDocument doc;
-            doc["deviceId"]   = DEVICE_ID;
-            doc["event"]      = "session_end";
-            doc["entries"]    = logCount;
-            doc["money_left"] = (int)totalMoney;
-            doc["waterLevel"] = waterLevel;
-            doc["sw0"]        = swState[0];
-            doc["sw1"]        = swState[1];
-            JsonArray procs = doc["procActualMs"].to<JsonArray>();
-            for (int p = 0; p < NUM_PROCESSES; p++) procs.add(procActualMs[p]);
+            doc["deviceId"] = DEVICE_ID;
+            doc["event"]    = "session_start";
+            doc["price"]    = pref_price;
+            doc["steps"]    = NUM_STEPS;
+            JsonArray durs = doc["stepDurations"].to<JsonArray>();
+            for (int s = 0; s < NUM_STEPS; s++) durs.add(pref_stepDurationMs[s]);
             String out; serializeJson(doc, out);
             mqttClient.publish(makeTopic("session").c_str(), out.c_str(), false);
         }
-        totalMoney = 0.0f;
-        clearLog();
-        transitionTo(STATE_IDLE);
+        return;
+    }
+
+    unsigned long elapsed = millis() - stepStartTime;
+
+    // Step ปัจจุบันครบเวลา?
+    if (elapsed >= (unsigned long)pref_stepDurationMs[currentStep]) {
+        char logEv[24];
+        snprintf(logEv, sizeof(logEv), "STEP_%d_DONE", currentStep + 1);
+        addLog(logEv, (uint32_t)elapsed);
+
+        setChannelRelay(currentStep, false);
+        setLED(currentStep, false);
+
+        currentStep++;
+
+        if (currentStep >= NUM_STEPS) {
+            // ครบ 6 step → SUMMARY
+            allRelaysOff(); allLEDsOff();
+            display.showNumberDec(0, false, 4, 0);
+            Serial.println(F("[OP] All steps complete → SUMMARY"));
+            transitionTo(STATE_SUMMARY);
+            return;
+        }
+
+        // เริ่ม step ถัดไป
+        stepStartTime = millis();
+        setChannelRelay(currentStep, true);
+        setLED(currentStep, true);
+        display.showNumberDec(currentStep + 1, false, 4, 0);
+
+        Serial.printf("[OP] Step %d/%d → LD%d ON | duration=%d ms\n",
+            currentStep + 1, NUM_STEPS, currentStep, pref_stepDurationMs[currentStep]);
+        snprintf(logEv, sizeof(logEv), "STEP_%d_START", currentStep + 1);
+        addLog(logEv);
+        sendPiStep(currentStep + 1);
+    }
+}
+
+void doSummaryAndReset() {
+    addLog("SESSION_END");
+    printSummary();
+    if (mqttClient.connected()) {
+        JsonDocument doc;
+        doc["deviceId"]  = DEVICE_ID;
+        doc["event"]     = "session_end";
+        doc["entries"]   = logCount;
+        doc["price"]     = pref_price;
+        doc["waterLevel"]= waterLevel;
+        doc["waterDesc"] = waterLevelDesc(waterLevel);
+        doc["sw0"]       = swState[0];
+        doc["sw1"]       = swState[1];
+        JsonArray wls = doc["wl"].to<JsonArray>();
+        for (int i = 0; i < NUM_WL_LEVELS; i++) wls.add(wlState[i]);
+        String out; serializeJson(doc, out);
+        mqttClient.publish(makeTopic("session").c_str(), out.c_str(), false);
+    }
+    totalMoney = 0.0f;
+    clearLog();
+    transitionTo(STATE_IDLE);
+}
+
+// ── SUMMARY: รอกด START เพื่อ reset กลับ IDLE ──
+void handleSummary() {
+    if (stateChanged) {
+        stateChanged = false;
+        allRelaysOff();
+        allLEDsOff();
+        display.showNumberDec(0, false, 4, 0);
+        Serial.printf("[SUMMARY] WaterLevel=%d/6 | SW0=%d SW1=%d\n",
+            waterLevel, swState[0], swState[1]);
+        String qr = "vend://" + DEVICE_ID + "/done";
+        sendBLE(qr);
+        Serial.println(F("[SUMMARY] Press START (or any BTN) to view log & reset"));
+    }
+
+    if (btnStart.pressEvent || btnAny.anyPressEvent) {
+        addLog("SUMMARY_VIEW");
+        doSummaryAndReset();
     }
 }
 
 void handleLocked() {
     if (stateChanged) {
         stateChanged = false;
-        allOff();
         display.showNumberDec(1337, false, 4, 0);
-        Serial.println(F("[LOCKED] Hardware error — reset required."));
+        Serial.println(F("[LOCKED] Hardware error — check I2C wiring. Reset required."));
     }
     static unsigned long lastWarn = 0;
     if (millis()-lastWarn > 5000) {
         lastWarn = millis();
-        Serial.println(F("[LOCKED] Halted."));
+        Serial.println(F("[LOCKED] System halted."));
     }
 }
 
@@ -1188,12 +1474,13 @@ void handleLocked() {
 // ============================================================
 void setup() {
     Serial.begin(115200);
+    PiSerial.begin(115200, SERIAL_8N1, PI_UART_RX, PI_UART_TX);
     delay(600);
     Serial.println(F("\n╔═══════════════════════════════════════════════╗"));
-    Serial.println(F("║  CATPAW FIRMWARE v1.0  |  ESP32-S3           ║"));
-    Serial.println(F("║  Sequential Process | MQTT | BLE->QR         ║"));
+    Serial.println(F("║  MACHINE FIRMWARE v3.0  |  ESP32-S3          ║"));
+    Serial.println(F("║  Fixed-Price 6-Step | MQTT | BLE->QR (CYD)   ║"));
     Serial.println(F("╚═══════════════════════════════════════════════╝"));
-    Serial.println(F("Type HELP for commands\n"));
+    Serial.println(F("Type HELP for all commands\n"));
 
     loadPreferences();
 
@@ -1231,6 +1518,7 @@ void loop() {
     handleSerial();
     updateButtons();
     handleTelemetry();
+    readPi();
 
     if (dbg_verbose) {
         static unsigned long lv = 0;
@@ -1245,11 +1533,13 @@ void loop() {
             Wire.requestFrom((uint8_t)0x1F, (uint8_t)1);
             uint8_t r4 = Wire.available() ? Wire.read() : 0xFF;
             Serial.printf("[VRB] BTN(0x1E)=0b");
-            for(int b=7;b>=0;b--) Serial.print((r3>>b)&1);
+            for (int b = 7; b >= 0; b--) Serial.print((r3>>b)&1);
             Serial.printf("  WL(0x1F)=0b");
-            for(int b=7;b>=0;b--) Serial.print((r4>>b)&1);
-            Serial.printf("  BTN0=%s PROC=%d WL=%d\n",
-                btnStart.isPressed?"ON":"off", currentProcess, waterLevel);
+            for (int b = 7; b >= 0; b--) Serial.print((r4>>b)&1);
+            Serial.printf("  WaterLv=%d | Step=%d/%d\n",
+                waterLevel,
+                currentState == STATE_OPERATION ? currentStep+1 : 0,
+                NUM_STEPS);
         }
     }
 
