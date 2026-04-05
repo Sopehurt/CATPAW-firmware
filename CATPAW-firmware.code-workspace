@@ -1,0 +1,14 @@
+{
+	"folders": [
+		{
+			"path": ".."
+		},
+		{
+			"name": "CAT CARWASH firmware",
+			"path": "../../CAT CARWASH firmware"
+		}
+	],
+	"settings": {
+		"ROS2.distro": "melodic"
+	}
+}
